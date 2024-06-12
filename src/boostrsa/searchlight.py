@@ -29,7 +29,7 @@ def calc_sl_precision(residuals,
     :param masking_indexes(np.array):  , shape: (#channel) / index of masking brain
     :param n_thread_per_block(int): block per thread
     
-    return (np.ndarray), shape: (#channel, #run, #neighbor, #neighbor)
+    return (np.ndarray), shape: (#channel, #run, combination(#neighbor,2))
     """
     
     n_run = residuals.shape[0]
@@ -106,7 +106,7 @@ def calc_sl_rdm_crossnobis(n_split_data,
                            masking_indexes,
                            conds, 
                            sessions, 
-                           n_thread_per_block = 1000):
+                           n_thread_per_block = 1024):
     """
     Calculate searchlight crossnobis rdm
     
