@@ -3,6 +3,11 @@ dist/
 build/
 *.egg-info/
 *.egg
+*.pyc
+__pycache__/
+
+# Ignore checkpoints
+.checkpoints/
 
 # Ignore pycache
 __pycache__/
