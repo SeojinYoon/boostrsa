@@ -7,7 +7,7 @@ build/
 __pycache__/
 
 # Ignore checkpoints
-.checkpoints/
+**/.ipynb_checkpoints/
 
 # Ignore pycache
 __pycache__/

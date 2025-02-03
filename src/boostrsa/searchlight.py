@@ -1,19 +1,29 @@
 
 # Common Libraries
 import os
+import sys
 import numpy as np
 from numba import cuda, jit
 import cupy as cp
 import itertools
 from tqdm import trange
 from rsatoolbox.rdm import concat, RDMs
+from itertools import combinations
 
 # Custom Libraries
-from boostrsa.boostrsa_types import ShrinkageMethod
-from boostrsa.cores.cpu.matrix import convert_1d_to_symmertic, mean_fold_variance
-from boostrsa.cores.cpgpu.stats import _covariance_diag, _covariance_eye
-from boostrsa.cores.gpu.mask import set_mask
-from boostrsa.cores.gpu.matrix import calc_kernel, rdm_from_kernel
+if os.getenv("boostrsa_isRunSource"):
+    sys.path.append(os.getenv("boostrsa_source_home"))
+    from boostrsa_types import ShrinkageMethod
+    from cores.cpu.matrix import convert_1d_to_symmertic, mean_fold_variance
+    from cores.cpu.mask import set_mask
+    from cores.cpgpu.stats import _covariance_diag, _covariance_eye
+    from cores.gpu.matrix import calc_kernel, rdm_from_kernel
+else:
+    from boostrsa.boostrsa_types import ShrinkageMethod
+    from boostrsa.cores.cpu.matrix import convert_1d_to_symmertic, mean_fold_variance
+    from boostrsa.cores.cpu.mask import set_mask
+    from boostrsa.cores.cpgpu.stats import _covariance_diag, _covariance_eye
+    from boostrsa.cores.gpu.matrix import calc_kernel, rdm_from_kernel
 
 # Functions
 def calc_sl_precision(residuals, 
@@ -21,7 +31,8 @@ def calc_sl_precision(residuals,
                       n_split_data, 
                       masking_indexes, 
                       n_thread_per_block = 1024,
-                      shrinkage_method = "shrinkage_diag"):
+                      shrinkage_method = "shrinkage_diag",
+                      dtype = np.float32):
     """
     Calculate precision matrix on each center which is calculated based on neighbor information on each center
     
@@ -33,6 +44,8 @@ def calc_sl_precision(residuals,
     
     return (np.ndarray), shape: (#channel, #run, combination(#neighbor, 2))
     """
+    if residuals.dtype != dtype:
+        residuals = residuals.astype(dtype)
     
     n_run = residuals.shape[0]
     n_p = residuals.shape[1]
@@ -47,29 +60,20 @@ def calc_sl_precision(residuals,
     
     chunk_precisions = []
     for i in trange(0, n_center, n_split_data):
-        # select neighbors
+        """
+        Masks are made by selected centers' neighbor
+
+        GPU memory capacitiy: (#selected_center, #channel)
+        """
         target_neighbors = neighbors[i:i + n_split_data, :]
-        len_target = len(target_neighbors)
+        n_target_center = len(target_neighbors)
         
-        # output_1d
-        mask_out = cuda.to_device(np.zeros((len_target, n_channel)))
-
-        # Make mask - neighbor
-        set_mask[n_block, n_thread_per_block](target_neighbors, masking_indexes, mask_out)
-        
-        # sync
-        cuda.synchronize()
-
         # Apply mask
-        cpu_mask = mask_out.copy_to_host()
-        masked_residuals = []
-        for j in range(len(target_neighbors)):
-            masked_residuals.append(residuals[:, :, cpu_mask[j] == 1])
-        masked_residuals = np.array(masked_residuals)
-
-        del mask_out
-        cuda.defer_cleanup()
-
+        mask = set_mask(target_neighbors, masking_indexes)
+        masked_residuals = np.empty((n_target_center, n_run, n_p, n_neighbor), dtype = residuals.dtype)
+        for j, m in enumerate(mask):
+            masked_residuals[j] = residuals[:, :, m == 1]
+    
         # Calculate demean
         target_residuals = masked_residuals.reshape(-1, n_p, n_neighbor)
         mean_residuals = np.mean(target_residuals, axis = 1, keepdims=1)
@@ -88,7 +92,7 @@ def calc_sl_precision(residuals,
         cuda.synchronize()
         
         # concat
-        stack_precisions = stack_precisions.reshape(len_target, n_run, n_neighbor, n_neighbor)
+        stack_precisions = stack_precisions.reshape(n_target_center, n_run, n_neighbor, n_neighbor)
         stack_precisions = stack_precisions[:, :, r, c]
     
         # add chunk
@@ -108,7 +112,8 @@ def calc_sl_rdm_crossnobis(n_split_data,
                            masking_indexes,
                            conds, 
                            sessions, 
-                           n_thread_per_block = 1024):
+                           n_thread_per_block = 1024,
+                           dtype = np.float32):
     """
     Calculate searchlight crossnobis rdm on each center.
     
@@ -122,10 +127,15 @@ def calc_sl_rdm_crossnobis(n_split_data,
     :param sessions(np.array - 1d): session corressponding to conds
     :param n_thread_per_block(int): , block per thread
     """
+    if measurements.dtype != dtype:
+        measurements = measurements.astype(dtype)
+        precs = precs.astype(dtype)
+        
     # Data configuration
     n_run = len(np.unique(sessions))
-    n_cond = len(np.unique(conds))
-    n_dissim = int((n_cond * n_cond - n_cond) / 2)
+    n_cond = len(conds)
+    n_unique_cond = len(np.unique(conds))
+    n_dissim = int((n_unique_cond * n_unique_cond - n_unique_cond) / 2)
     n_neighbor = neighbors.shape[-1]
     uq_conds = np.unique(conds)
     n_channel = measurements.shape[-1]
@@ -134,7 +144,7 @@ def calc_sl_rdm_crossnobis(n_split_data,
     assert n_channel == masking_indexes.shape[0], "n_channel should be same"
     
     # Fold
-    fold_info = cuda.to_device(list(itertools.combinations(np.arange(len(uq_sessions)), 2)))
+    fold_info = cuda.to_device(list(combinations(np.arange(len(uq_sessions)), 2)))
     n_fold = len(fold_info)
     total_calculation = n_split_data * n_fold
     
@@ -156,33 +166,34 @@ def calc_sl_rdm_crossnobis(n_split_data,
 
         n_target_centers  = len(target_centers)
 
-        # output_1d
-        mask_out = cuda.to_device(np.zeros((n_target_centers, n_channel)))
-
-        # Make mask - neighbor
-        set_mask[n_block, n_thread_per_block](target_neighbors, masking_indexes, mask_out)
-        cuda.synchronize()
-
         # Apply mask
-        cpu_mask = mask_out.copy_to_host()
-        masked_measurements = []
-        for j in range(n_target_centers):
-            masked_measurements.append(measurements[:, cpu_mask[j] == 1])
-        masked_measurements = np.array(masked_measurements)
+        mask = set_mask(target_neighbors, masking_indexes)
+        masked_measurements = np.empty((n_split_data, n_cond, n_neighbor), dtype = dtype)
+        for j, m in enumerate(mask):
+            masked_measurements[j] = measurements[:, m == 1]
         masked_measurements = cp.asarray(masked_measurements)
 
-        del mask_out
-        cuda.defer_cleanup()
+        """
+        1. Convert precision matrix to covariance matrix
+        GPU memory capacitiy: (#selected_center, #run, #channel, #channel)
 
-        # precision
+        2. Mean covariance between two runs
+        GPU memory capacity: (#center, #run, #channel, #channel)
+        """
         prec_mat_shape = int((n_neighbor * n_neighbor - n_neighbor) / 2) + n_neighbor
         target_precs = precs[i:i+n_target_centers].reshape(-1, prec_mat_shape)
-        target_precs = np.array([convert_1d_to_symmertic(pre, size = n_neighbor) for pre in target_precs])
+        target_precs = np.array([convert_1d_to_symmertic(pre, size = n_neighbor, dtype = dtype) for pre in target_precs])
         variances = cp.linalg.inv(cp.asarray(target_precs))
         variances = variances.reshape(n_target_centers, n_run, n_neighbor, n_neighbor).get()
-        fold_preicions = cp.linalg.inv(cp.asarray(mean_fold_variance(variances, fold_info.copy_to_host())))
-        fold_preicions = cuda.to_device(fold_preicions.reshape(n_target_centers, len(fold_info), n_neighbor, n_neighbor).get())
         mempool.free_all_blocks()
+
+        """
+        Calculate mean precision matrix between two runs
+        """
+        fold_preicions = cp.linalg.inv(cp.asarray(mean_fold_variance(variances, fold_info.copy_to_host()))).get()
+        mempool.free_all_blocks()
+        
+        fold_preicions = cuda.to_device(fold_preicions.reshape(n_target_centers, len(fold_info), n_neighbor, n_neighbor))
 
         # Avg conds per session
         avg_measurements = []
@@ -211,15 +222,15 @@ def calc_sl_rdm_crossnobis(n_split_data,
         # make kernel
         avg_measurements = cuda.to_device(avg_measurements)
 
-        matmul1_out = cuda.to_device(np.zeros((n_target_centers, n_fold, n_cond, n_neighbor)))
-        kernel_out = cuda.to_device(np.zeros((n_target_centers, n_fold, n_cond, n_cond)))
+        matmul1_out = cuda.to_device(np.zeros((n_target_centers, n_fold, n_unique_cond, n_neighbor), dtype = dtype))
+        kernel_out = cuda.to_device(np.zeros((n_target_centers, n_fold, n_unique_cond, n_unique_cond), dtype = dtype))
         calc_kernel[block_2ds, thread_2ds](avg_measurements, fold_preicions, fold_info, matmul1_out, kernel_out)
 
         cuda.synchronize()
         del matmul1_out
         cuda.defer_cleanup()
 
-        rdm_out = cuda.to_device(np.zeros((n_target_centers, n_fold, n_dissim)))
+        rdm_out = cuda.to_device(np.zeros((n_target_centers, n_fold, n_dissim), dtype = dtype))
         rdm_from_kernel[block_2ds, thread_2ds](kernel_out, n_neighbor, rdm_out)
 
         cuda.synchronize()
@@ -240,7 +251,8 @@ def calc_sl_precisions(centers,
                        mask_1d_indexes,
                        save_dir_path,
                        shrinkage_method = ShrinkageMethod.shrinkage_diag,
-                       n_thread_per_block = 1024):
+                       n_thread_per_block = 1024,
+                       dtype = np.float32):
     """
     Calculate searchlight precision matrix along multiple difference #neighbor
     precision matrices are saved on save_dir_path per #neighbor
@@ -267,8 +279,9 @@ def calc_sl_precisions(centers,
                                           neighbors = target_neighbors,
                                           n_split_data = n_split_data,
                                           masking_indexes = mask_1d_indexes,
-                                          shrinkage_method = ShrinkageMethod.shrinkage_diag,
-                                          n_thread_per_block = n_thread_per_block)
+                                          shrinkage_method = shrinkage_method,
+                                          n_thread_per_block = n_thread_per_block,
+                                          dtype = dtype)
         sl_precisions = np.concatenate(sl_precisions)
     
         save_path = os.path.join(save_dir_path, f"precision_neighbor{n_neighbor}")
@@ -285,7 +298,8 @@ def calc_sl_rdm_crossnobises(n_split_data,
                              masking_indexes, 
                              conditions, 
                              sessions,
-                             n_thread_per_block = 1024):
+                             n_thread_per_block = 1024,
+                             dtype = np.float32):
     """
     Calculate searchlight crossnobis rdm on each center.
     However, this function calculate RDM differently if n_neighbor is different
@@ -328,29 +342,31 @@ def calc_sl_rdm_crossnobises(n_split_data,
                                                                 masking_indexes = masking_indexes,
                                                                 conds = conditions,
                                                                 sessions = sessions,
-                                                                n_thread_per_block = n_thread_per_block)
+                                                                n_thread_per_block = n_thread_per_block,
+                                                                dtype = dtype)
         rdm_crossnobis_gpus = np.concatenate(rdm_crossnobis_gpus)
     
         # Make sl_rdms
         rdm_crossnobis_gpus = RDMs(rdm_crossnobis_gpus,
                                        pattern_descriptors = {
-                                           "index" : list(np.arange(0, len(rdm_conds))),
-                                           "events" : list(rdm_conds),
+                                           "index" : np.arange(0, len(rdm_conds)).tolist(),
+                                           "events" : rdm_conds.tolist(),
                                        },
                                        rdm_descriptors = {
-                                           "voxel_index" : target_centers,
-                                           "index" : np.arange(0, len(target_centers))
+                                           "voxel_index" : target_centers.tolist(),
+                                           "index" : np.arange(0, len(target_centers)).tolist()
                                        })
         rdm_crossnobis_gpus.dissimilarity_measure = "crossnobis"
-        
 
         # Acc
         rdms.append(rdm_crossnobis_gpus)
         centers.append(target_centers)
-
+    
     # Concat
-    rdms = concat(rdms)
     centers = np.concatenate(centers)
+    
+    rdms = concat(rdms)
+    rdms.rdm_descriptors["voxel_index"] = centers.tolist()
     
     # Reorder
     rdms = rdms.subsample(by = "voxel_index", value = np.sort(centers))

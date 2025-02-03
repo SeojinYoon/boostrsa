@@ -1,6 +1,13 @@
 
+import os
+import sys
 from numba import cuda, jit
-from boostrsa.cores.gpu.basic_operations import matmul
+
+if os.getenv("boostrsa_isRunSource"):
+    sys.path.append(os.getenv("boostrsa_source_home"))
+    from cores.gpu.basic_operations import matmul
+else:
+    from boostrsa.cores.gpu.basic_operations import matmul
 
 @jit(nopython=True)
 def upper_tri_1d_index(i, j, n_col, k):
@@ -102,8 +109,6 @@ def calc_kernel(measurments, precisions, fold_info, out1, out2):
     """
     Calculate rdm kernel for calculating crossnobis
     
-    (2048, 4, 8, 93)
-    
     :param measurments(Device array): , shape: (n_data, n_run, n_cond, n_neighbor)
     :param precisions(Device array): , shape: (n_data, n_fold, n_neighbor, n_neighbor)
     :param fold_info(Device array): fold information - [[fold1, fold2], ...]
@@ -121,5 +126,4 @@ def calc_kernel(measurments, precisions, fold_info, out1, out2):
             # measurements1 @ noise @ measurements2.T
             matmul(measurments[i][data1_i], precisions[i][j], out1[i][j])
             matmul(out1[i][j], measurments[i][data2_i].T, out2[i][j])
-
 

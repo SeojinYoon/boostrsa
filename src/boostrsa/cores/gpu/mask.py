@@ -19,3 +19,12 @@ def set_mask(neighbors, brain_1d_indexes, out):
             for brain_i, brain_pos in enumerate(brain_1d_indexes):
                 if brain_pos == neighbor_pos:
                     out[i][brain_i] = 1
+if __name__ == "__main__":
+    n_split_data = 2024
+    n_channel = 200000
+    n_thread_per_block = 1024
+    
+    n_block = int(np.ceil(n_split_data / n_thread_per_block))
+    mask_out = cuda.to_device(np.zeros((n_split_data, n_channel)))
+    target_neighbors = neighbors[0:0 + n_split_data, :]
+    set_mask[n_block, n_thread_per_block](target_neighbors, masking_indexes, mask_out)
