@@ -78,7 +78,7 @@ def scaling(out, lambs):
                     out[i][j][k] = (1 - lamb)
 
 @cuda.jit(device=True, inline=True)
-def matmul(a,b, out):
+def matmul(a, b, out):
     """
     Matrix multiplication a @ b
     
