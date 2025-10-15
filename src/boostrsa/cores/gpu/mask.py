@@ -2,7 +2,7 @@
 from numba import cuda, jit
 
 @cuda.jit
-def set_mask(neighbors, brain_1d_indexes, out):
+def set_mask_gpu(neighbors, brain_1d_indexes, out):
     """
     Set neighbor mask(iterate over all neighbors)
 

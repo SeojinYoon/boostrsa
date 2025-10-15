@@ -2,47 +2,54 @@
 # Common Libraries
 import os
 import sys
-import numpy as np
-from numba import cuda, jit
-import cupy as cp
 import itertools
+import cupy as cp
+import numpy as np
+import pandas as pd
 from tqdm import trange
+from pathlib import Path
+from numba import cuda, jit
+from itertools import combinations, product
 from rsatoolbox.rdm import concat, RDMs
-from itertools import combinations
 
 # Custom Libraries
 if os.getenv("boostrsa_isRunSource"):
     sys.path.append(os.getenv("boostrsa_source_home"))
     from boostrsa_types import ShrinkageMethod
-    from cores.cpu.matrix import convert_1d_to_symmertic, mean_fold_variance
-    from cores.cpu.mask import set_mask
+    from cores.cpu.matrix import convert_1d_to_symmertic, mean_fold_variance, reconstruct_sl_precisionMats
+    from cores.cpu.mask import set_mask_cpu
+    from cores.gpu.mask import set_mask_gpu
     from cores.cpgpu.stats import _covariance_diag, _covariance_eye
-    from cores.gpu.matrix import calc_kernel, rdm_from_kernel
+    from cores.gpu.matrix import calc_kernel, rdm_from_kernel, denoise, calc_sqrtMat
+    from cores.gpu.matrix import differentiate_measurements, calc_cv_distance
 else:
     from boostrsa.boostrsa_types import ShrinkageMethod
-    from boostrsa.cores.cpu.matrix import convert_1d_to_symmertic, mean_fold_variance
-    from boostrsa.cores.cpu.mask import set_mask
+    from boostrsa.cores.cpu.matrix import convert_1d_to_symmertic, mean_fold_variance, reconstruct_sl_precisionMats
+    from boostrsa.cores.cpu.mask import set_mask_cpu
+    from boostrsa.cores.gpu.mask import set_mask_gpu
     from boostrsa.cores.cpgpu.stats import _covariance_diag, _covariance_eye
-    from boostrsa.cores.gpu.matrix import calc_kernel, rdm_from_kernel
-
+    from boostrsa.cores.gpu.matrix import calc_kernel, rdm_from_kernel, denoise, calc_sqrtMat
+    from boostrsa.cores.gpu.matrix import differentiate_measurements, calc_cv_distance
+    
 # Functions
-def calc_sl_precision(residuals, 
-                      neighbors, 
-                      n_split_data, 
-                      masking_indexes, 
-                      n_thread_per_block = 1024,
-                      shrinkage_method = "shrinkage_diag",
+def calc_sl_precision(residuals: np.ndarray, 
+                      neighbors: np.ndarray, 
+                      n_split_data: int, 
+                      masking_indexes: np.array, 
+                      n_thread_per_block: int = 1024,
+                      shrinkage_method: str = "shrinkage_diag",
                       dtype = np.float32):
     """
     Calculate precision matrix on each center which is calculated based on neighbor information on each center
     
-    :param residuals(np.ndarray - shape: (#run, #point, #channel)): residual array after processing GLM
-    :param neighbors(np.ndarray - shape: (#center, #neighbor)): index information about neighbors surrounding each center
-    :param n_split_data(int): how many datas to process at once
-    :param masking_indexes(np.array- shape: (#channel)): 1d location index converted from 3D brain coordinate (x,y,z)
-    :param n_thread_per_block(int): #thread per block
+    :param residuals(shape: (#run, #point, #channel)): residual array after processing GLM
+    :param neighbors(shape: (#center, #neighbor)): index information about neighbors surrounding each center
+    :param n_split_data: how many datas to process at once
+    :param masking_indexes(shape: (#channel)): 1d location index converted from 3D brain coordinate (x,y,z)
+    :param n_thread_per_block: #thread per block
+    :param dtype: data type for storing array
     
-    return (np.ndarray), shape: (#channel, #run, combination(#neighbor, 2))
+    return (np.ndarray), shape: (#center, #run, combination(#neighbor, 2))
     """
     if residuals.dtype != dtype:
         residuals = residuals.astype(dtype)
@@ -69,7 +76,7 @@ def calc_sl_precision(residuals,
         n_target_center = len(target_neighbors)
         
         # Apply mask
-        mask = set_mask(target_neighbors, masking_indexes)
+        mask = set_mask_cpu(target_neighbors, masking_indexes)
         masked_residuals = np.empty((n_target_center, n_run, n_p, n_neighbor), dtype = residuals.dtype)
         for j, m in enumerate(mask):
             masked_residuals[j] = residuals[:, :, m == 1]
@@ -81,9 +88,9 @@ def calc_sl_precision(residuals,
 
         # Calculate covariance
         if shrinkage_method == ShrinkageMethod.shrinkage_diag:
-            covariances = _covariance_diag(target_residuals)
+            covariances = _covariance_diag(target_residuals, dtype = dtype)
         elif shrinkage_method == ShrinkageMethod.shrinkage_eye:
-            covariances = _covariance_eye(target_residuals)
+            covariances = _covariance_eye(target_residuals, dtype = dtype)
 
         # Calculate precision matrix
         stack_precisions = cp.linalg.inv(cp.asarray(covariances)).get()
@@ -101,31 +108,32 @@ def calc_sl_precision(residuals,
         # Clean data
         cuda.defer_cleanup()
         mempool.free_all_blocks()
-        
-    return chunk_precisions
 
-def calc_sl_rdm_crossnobis(n_split_data, 
-                           centers, 
-                           neighbors, 
-                           precs,
-                           measurements,
-                           masking_indexes,
-                           conds, 
-                           sessions, 
-                           n_thread_per_block = 1024,
+    return np.concatenate(chunk_precisions, axis = 0).astype(dtype)
+
+def calc_sl_rdm_crossnobis(n_split_data: int, 
+                           centers: np.array, 
+                           neighbors: np.array, 
+                           precs: np.array,
+                           measurements: np.array,
+                           masking_indexes: np.array,
+                           conds: np.array, 
+                           sessions: np.array, 
+                           n_thread_per_block: int = 1024,
                            dtype = np.float32):
     """
     Calculate searchlight crossnobis rdm on each center.
     
-    :param n_split_data(int): how many datas to process at once
-    :param centers(np.array): centers, shape: (#center)
-    :param neighbors(np.array): neighbors , shape: (#center, #neighbor)
-    :param precs(np.array): precisions , shape: (#channel, #run, #precision_mat_element)
-    :param measurements(np.array): measurment values , shape: (#cond, #channel)
-    :param masking_indexes: (np.array) , shape: (#channel) , index of masking brain
-    :param conds: conds(np.array - 1d)
-    :param sessions(np.array - 1d): session corressponding to conds
-    :param n_thread_per_block(int): , block per thread
+    :param n_split_data: how many datas to process at once
+    :param centers(shape: (#center)): centers, 
+    :param neighbors(#center, #neighbor): neighbors , shape: 
+    :param precs(shape: (#channel, #run, #precision_mat_element)): precisions 
+    :param measurements(shape: (#data, #channel)): measurment values
+    :param masking_indexes(shape: #channel): index of masking brain
+    :param conds(shape: #data): condition per data
+    :param sessions(shape: #data): session corressponding to conds
+    :param n_thread_per_block: block per thread
+    :param dtype: data type for storing array
     """
     if measurements.dtype != dtype:
         measurements = measurements.astype(dtype)
@@ -167,7 +175,7 @@ def calc_sl_rdm_crossnobis(n_split_data,
         n_target_centers  = len(target_centers)
 
         # Apply mask
-        mask = set_mask(target_neighbors, masking_indexes)
+        mask = set_mask_cpu(target_neighbors, masking_indexes)
         masked_measurements = np.empty((n_split_data, n_cond, n_neighbor), dtype = dtype)
         for j, m in enumerate(mask):
             masked_measurements[j] = measurements[:, m == 1]
@@ -243,31 +251,54 @@ def calc_sl_rdm_crossnobis(n_split_data,
         cuda.defer_cleanup()
         
     return rdm_outs, uq_conds
-
-def calc_sl_precisions(centers, 
-                       neighbors,
-                       residuals,
-                       n_split_data,
-                       mask_1d_indexes,
-                       save_dir_path,
-                       shrinkage_method = ShrinkageMethod.shrinkage_diag,
-                       n_thread_per_block = 1024,
-                       dtype = np.float32):
+    
+def calc_sl_precisions(centers: np.array, 
+                       neighbors: list,
+                       residuals: np.ndarray,
+                       prec_types: np.ndarray,
+                       n_split_data: int,
+                       mask_1d_indexes: np.array,
+                       save_dir_path: str,
+                       shrinkage_method: ShrinkageMethod = ShrinkageMethod.shrinkage_diag,
+                       n_thread_per_block: int = 1024,
+                       dtype = np.float32) -> dict:
     """
     Calculate searchlight precision matrix along multiple difference #neighbor
     precision matrices are saved on save_dir_path per #neighbor
     
-    :param centers(np.array): centers, shape: (#center)
-    :param neighbors(list - shape: (#center, #neighbor)): index information about neighbors surrounding each center
-    :param residuals(np.ndarray - shape: (#run, #point, #channel)): residual array after processing GLM
-    :param n_split_data(int): how many datas to process at once
-    :param mask_1d_indexes(np.array- shape: (#channel)): 1d location index converted from 3D brain coordinate (x,y,z)
-    :param save_dir_path(string): directory path for saving precision matrix result
-    :param n_thread_per_block(int): #thread per block
+    :param centers(shape: (#center)): centers, 
+    :param neighbors(shape: (#center, #neighbor)): index information about neighbors surrounding each center
+    :param residuals(shape: (#session, #point, #channel)): residual array after processing GLM
+    :param prec_types(shape: #session): session types corresponding to each residual element
+    :param n_split_data: how many datas to process at once
+    :param mask_1d_indexes(shape: (#channel)): 1d location index converted from 3D brain coordinate (x,y,z)
+    :param save_dir_path: directory path for saving precision matrix result
+    :param shrinkage_method: shrinkage method
+    :param n_thread_per_block: #thread per block
+    :param dtype: data type for storing array
+
+    return {
+        "#neighbor{number}" : {
+            "center_indices" : center 1d indicies,
+            "neighbor_indices" : neighbor 1d indices,
+            "prec_types" : precision types
+        }
+    }
     """
+    # Neighbor info
     n_neighbors = np.array([neighbor.shape[-1] for neighbor in neighbors])
     uq_neighbors = np.unique(n_neighbors)
-    for n_neighbor in uq_neighbors:
+
+    # Investigate whether save_dir_path has already precision matrix
+    save_paths = [os.path.join(save_dir_path, f"precision_neighbor{n_neighbor}.npz") for n_neighbor in uq_neighbors]
+    for path in save_paths:
+        if os.path.exists(path):
+            print(f"already exist: {path}")
+            return
+
+    # Calculate precision matrix using searchlight method per #neighbor
+    result_info = {}
+    for n_neighbor, save_path in zip(uq_neighbors, save_paths):
         flags = (n_neighbors == n_neighbor)
         target_centers = centers[flags]
         
@@ -282,23 +313,86 @@ def calc_sl_precisions(centers,
                                           shrinkage_method = shrinkage_method,
                                           n_thread_per_block = n_thread_per_block,
                                           dtype = dtype)
-        sl_precisions = np.concatenate(sl_precisions)
-    
-        save_path = os.path.join(save_dir_path, f"precision_neighbor{n_neighbor}")
+
+        # Save
         np.savez(save_path, 
                  centers = target_centers, 
                  neighbors = target_neighbors,
-                 precision = sl_precisions)
+                 precision = sl_precisions,
+                 prec_types = prec_types)
         print(f"save: {save_path}")
+        result_info[f"#neighbor{n_neighbor}"] = {
+            "path" : save_path,
+            "center_indices" : target_centers,
+            "neighbor_indices" : target_neighbors,
+            "prec_types" : prec_types,
+        }
+        
+    return result_info
 
-def calc_sl_rdm_crossnobises(n_split_data,
-                             unique_n_neighbors, 
-                             precision_dir_path, 
-                             measurements, 
-                             masking_indexes, 
-                             conditions, 
-                             sessions,
-                             n_thread_per_block = 1024,
+def sqrt_precisions(precision_paths: list, 
+                    save_dir_path: str,
+                    dtype = np.float32):
+    """
+    Calculat square root about searchlight precision matrix
+    & Save the results on the save_dir_path
+    
+    :param precision_paths(element: str): precision matrix paths
+    :param save_dir_path: directory path for saving sqrt precision
+    """
+    if np.all([os.path.exists(path) for path in precision_paths]) == np.True_:
+        print(f"exist all precision matrices")
+
+    save_paths = [os.path.join(save_dir_path, "sqrt" + "_" + Path(path).name) for path in precision_paths]
+    for path in save_paths:
+        if os.path.exists(path):
+            print(f"already exist: {path}")
+            return
+
+    result_info = {}
+    for path, save_path in zip(precision_paths, save_paths):
+        # Load precision matrices
+        precision_dataSet = np.load(path)
+        target_centers = precision_dataSet["centers"]
+        target_neighbors = precision_dataSet["neighbors"]
+        sl_precisions = precision_dataSet["precision"]
+        prec_types = precision_dataSet["prec_types"]
+        
+        # Reconstruct precision matrix from 1D matrix into 2D matrix
+        _, n_neighbor = target_neighbors.shape
+        n_center, n_source, n_element = sl_precisions.shape
+        sl_precisions = reconstruct_sl_precisionMats(sl_precisions, n_neighbor = n_neighbor)
+        
+        # Calculate square root about the precision matrix 
+        sqrt_precisions = calc_sqrtMat(sl_precisions) # shape: (#center * #source, #n_neighbor, #n_neighbor)
+        r, c = np.triu_indices(n_neighbor, k = 0) # get upper triangle indices from #neighbor x #neighbor matrix
+        sqrt_precisions = sqrt_precisions[:, r, c] # shape: (#center * #source, #comb(n_neighbor, 2))
+        sqrt_precisions = sqrt_precisions.reshape((n_center, n_source, -1)) # shape: (#center, #source, #comb(n_neighbor, 2))
+        sqrt_precisions = sqrt_precisions.astype(dtype)
+        
+        # Save the sqrt precision result
+        np.savez(save_path, 
+                 centers = target_centers, 
+                 neighbors = target_neighbors,
+                 sqrt_precision = sqrt_precisions,
+                 prec_types = prec_types)
+        print(f"save_path: {save_path}")
+        result_info[f"#neighbor{n_neighbor}"] = {
+            "path" : save_path,
+            "center_indices" : target_centers,
+            "neighbor_indices" : target_neighbors,
+            "prec_types" : prec_types,
+        }
+    return result_info
+
+def calc_sl_rdm_crossnobises(n_split_data: int,
+                             unique_n_neighbors: np.array, 
+                             precision_dir_path: str, 
+                             measurements: np.array, 
+                             masking_indexes: np.array, 
+                             conditions: np.array, 
+                             sessions: np.array,
+                             n_thread_per_block: int = 1024,
                              dtype = np.float32):
     """
     Calculate searchlight crossnobis rdm on each center.
@@ -311,15 +405,16 @@ def calc_sl_rdm_crossnobises(n_split_data,
     This function load precision matrix on precision_dir_path.
     So you have to check whether the precision matrices are not overlapped.
     
-    :param n_split_data(int): how many datas to process at once
-    :param unique_n_neighbors(np.array): unique #neighbor 
-    :param precision_dir_path(string): path saved for precision matrix
-    :param measurements(np.array): measurment values , shape: (#cond, #channel)
-    :param masking_indexes: (np.array) , shape: (#channel) , index of masking brain
-    :param conditions(np.array - 1d): condition array corresponding to measurements
-    :param sessions(np.array - 1d): session corressponding to conds
+    :param n_split_data: how many datas to process at once
+    :param unique_n_neighbors: unique #neighbor 
+    :param precision_dir_path: path saved for precision matrix
+    :param measurements(shape: #data, #channel): measurment values
+    :param masking_indexes(shape: #channel):  index of masking brain
+    :param conditions(shape: #data): condition array corresponding to measurements
+    :param sessions(shape: #data): session corressponding to conds
     :param n_thread_per_block(int): block per thread
-
+    :param dtype: data type for storing array
+    
     return (rsatoolbox.rdm.RDMs): RDM matrix about each brain coordinate
     """
 
@@ -356,6 +451,374 @@ def calc_sl_rdm_crossnobises(n_split_data,
                                            "voxel_index" : target_centers.tolist(),
                                            "index" : np.arange(0, len(target_centers)).tolist()
                                        })
+        rdm_crossnobis_gpus.dissimilarity_measure = "crossnobis"
+
+        # Acc
+        rdms.append(rdm_crossnobis_gpus)
+        centers.append(target_centers)
+    
+    # Concat
+    centers = np.concatenate(centers)
+    
+    rdms = concat(rdms)
+    rdms.rdm_descriptors["voxel_index"] = centers.tolist()
+    
+    # Reorder
+    rdms = rdms.subsample(by = "voxel_index", value = np.sort(centers))
+    
+    return rdms
+
+def calc_sl_rdm_crossnobis_SS(measurements: np.ndarray,
+                              conditions: np.ndarray,
+                              sessions: np.ndarray,
+                              subSessions: np.ndarray,
+                              centers: np.ndarray,
+                              neighbors: np.ndarray,
+                              sqrt_precisions: np.ndarray,
+                              precision_types: np.ndarray,
+                              masking_indexes: np.ndarray,
+                              n_split_data: int,
+                              n_thread_per_block: int = 1024,
+                              dtype = np.float32):
+    """
+    Calculate searchlight crossnobis distance considering session and subSession
+    
+    :param measurements(shape: (#data, #channel)): measurment values
+    :param conditions(shape: #data): condition per measurement
+    :param sessions(shape: #data): session per measurement
+    :param subSessions(shape: #data): subSession per measurement
+    :param centers(shape: #center): center voxel index
+    :param neighbors(#center, #neighbor): neighbor indices per center voxel index 
+    :param sqrt_precisions(shape: (#channel, #precision_types, #precision_mat_element)): precision matrix per channel
+    :param precision_types(shape: #precision_types): precision type corresponding to sqrt_precision elements
+    :param masking_indexes(shape: #channel): index of masking brain
+    :param n_split_data: how many datas to process at once
+    :param n_thread_per_block: block per thread
+    :param dtype: data type for storing array
+    """
+    if measurements.dtype != dtype:
+        measurements = measurements.astype(dtype)
+        sqrt_precisions = sqrt_precisions.astype(dtype)
+    
+    # Get unique element according to appearance order
+    uq_sessions = np.array(list(dict.fromkeys(sessions)))
+    uq_subSessions = np.array(list(dict.fromkeys(subSessions)))
+    uq_conditions = np.array(list(dict.fromkeys(conditions)))
+
+    condition_index_info = {}
+    for i in range(len(uq_conditions)):
+        condition_index_info[uq_conditions[i]] = i
+    
+    session_index_info = {}
+    for i in range(len(uq_sessions)):
+        session_index_info[uq_sessions[i]] = i
+        
+    subSession_index_info = {}
+    for i in range(len(uq_subSessions)):
+        subSession_index_info[uq_subSessions[i]] = i
+    
+    # Reorder measurements & conditions
+    measurement_sort_info = pd.DataFrame({
+        "condition" : conditions,
+        "session" : sessions,
+        "subSession" : subSessions,
+    })
+    measurement_sort_info["origin_i"] = measurement_sort_info.index
+    measurement_sort_info["condition_i"] = [condition_index_info[e] for e in measurement_sort_info["condition"]]
+    measurement_sort_info["session_i"] = [session_index_info[e] for e in measurement_sort_info["session"]]
+    measurement_sort_info["subSession_i"] = [subSession_index_info[e] for e in measurement_sort_info["subSession"]]
+    measurement_sort_info = measurement_sort_info.sort_values(
+        by=["session_i", "condition_i", "subSession_i"],
+        ascending=[True, True, True]
+    ).reset_index(drop=True)
+    measurements = measurements[measurement_sort_info["origin_i"]]
+
+    # Reorder precisions
+    precision_type_df = pd.DataFrame([e.split("-") for e in precision_types])
+    precision_type_df.columns = ["session", "subSession"]
+    precision_type_df["session_i"] = precision_type_df["session"].map(session_index_info)
+    precision_type_df["subSession_i"] = precision_type_df["subSession"].map(subSession_index_info)
+    precision_type_df["origin"] = precision_type_df.index
+    precision_type_df = precision_type_df.sort_values(
+        by=["session_i", "subSession_i"],
+        ascending=[True, True]
+    ).reset_index(drop=True)
+    sqrt_precisions = sqrt_precisions[:, precision_type_df["origin"], :]
+
+    # A number of data
+    n_data, n_channel = measurements.shape
+    n_precision = len(precision_types)
+    n_uq_session = len(uq_sessions)
+    n_uq_subSession = len(uq_subSessions)
+    n_uq_condition = len(uq_conditions)
+    n_center, n_neighbor = neighbors.shape
+    n_precision_element = int(((n_neighbor * n_neighbor) - n_neighbor) / 2 + n_neighbor)
+    
+    # index information for calculating difference
+    n_dissim = len(list(combinations(uq_conditions, 2)))
+    diff_conditions = np.array(list(combinations(uq_conditions, 2)))
+    diff_info_array = np.array([np.c_[np.repeat(session, n_dissim), diff_conditions] for session in uq_sessions])
+    diff_info_df = pd.DataFrame(np.concatenate(diff_info_array, axis = 0))
+    diff_info_df.columns = ["session", "cond1", "cond2"]
+    diff_info_df["session_i"] = [session_index_info[session] for session in diff_info_df["session"]] # session index
+    diff_info_df["uq_cond1_i"] = [condition_index_info[cond] for cond in diff_info_df["cond1"]] # cond1 index
+    diff_info_df["uq_cond2_i"] = [condition_index_info[cond] for cond in diff_info_df["cond2"]] # cond2 index
+    diff_info_df["cond1_i"] = diff_info_df["session_i"] * n_uq_condition + diff_info_df["uq_cond1_i"] # measurement index information of cond1
+    diff_info_df["cond2_i"] = diff_info_df["session_i"] * n_uq_condition + diff_info_df["uq_cond2_i"] # measurement index information of cond2
+    diff_info_df["dissim_i"] = np.tile(np.arange(n_dissim), n_uq_session) # dissim index 
+    del diff_info_array
+
+    # Prepare multiplication info for denoising
+    mul_mapping = np.zeros((n_neighbor, n_neighbor))
+    r, c = np.triu_indices(n_neighbor, k = 0)
+    mul_mapping[r, c] = np.arange(r.shape[0])
+    mul_mapping += mul_mapping.T
+    idx = np.diag_indices(mul_mapping.shape[0])
+    mul_mapping[idx] = mul_mapping[idx] / 2
+    mul_mapping = mul_mapping.astype(int)
+    mul_mapping = cuda.to_device(mul_mapping)
+
+    # Prepare cross-validation info within same dissimilarity
+    n_cv = len(list(combinations(uq_sessions, 2)))
+    cv_diff_indices = np.zeros((n_split_data * n_cv * n_dissim, 4), dtype = np.uint32) 
+    i = 0
+    for center_i, dissim_i in product(np.arange(n_split_data), np.arange(n_dissim)):
+        indices = np.where(diff_info_df["dissim_i"] == dissim_i)[0] + (center_i * n_uq_session * n_dissim)
+        comb = np.array(list(combinations(indices, 2)))
+    
+        for j in range(len(comb)):
+            diff1_i, diff2_i = comb[j]
+            cv_diff_indices[i] = np.r_[center_i, dissim_i, diff1_i, diff2_i]
+            i += 1
+    cv_diff_df = pd.DataFrame(cv_diff_indices)
+    cv_diff_df.columns = ["center_i", "dissim_i", "diff1_i", "diff2_i"]
+    cv_diff_df['cv_i'] = cv_diff_df.groupby(['center_i', 'dissim_i']).cumcount()
+
+    # Memory pool
+    mempool = cp.get_default_memory_pool()
+    n_block = int(np.ceil(n_split_data / n_thread_per_block))
+    
+    # Calculation
+    rdm_outs = []
+    for i in trange(0, n_center, n_split_data):
+        """
+        Select centers neighbors and square root precision matrix
+        """
+        # Select neighbors
+        target_range = range(i, min(len(centers), i + n_split_data))
+        target_centers = centers[target_range]
+        target_neighbors = neighbors[target_range, :]
+        
+        n_target_center  = len(target_centers)
+        target_sqrt_precisions = sqrt_precisions[target_range]
+        target_sqrt_precisions = target_sqrt_precisions.reshape(n_target_center * n_precision, n_precision_element)
+        target_sqrt_precisions = cuda.to_device(target_sqrt_precisions)
+    
+        """
+        Apply mask
+    
+        Required GPU memory capacitiy
+            - mask_out: (#center, #channel)
+            - masked_measurements: (#center * #data, #neighbor)
+        """
+        # Masking
+        cpu_mask = set_mask_cpu(target_neighbors, masking_indexes)
+
+        """
+        if n_target_center % n_thread_per_block == 0:
+            n_block_forMask = n_target_center // n_thread_per_block
+        else:
+            n_block_forMask = n_target_center // n_thread_per_block + 1
+        mask_out = cuda.to_device(np.zeros((n_target_center, n_channel), dtype = np.uint8))
+        set_mask_gpu[n_block_forMask, n_thread_per_block](target_neighbors, masking_indexes, mask_out)
+        cuda.synchronize()
+
+        del mask_out
+        cuda.defer_cleanup()
+        """
+        
+        ## Make mask
+        # cpu_mask = mask_out.copy_to_host()
+        masked_measurements = []
+        for j in range(n_target_center):
+            masked_measurements.append(measurements[:, cpu_mask[j] == 1])
+        masked_measurements = np.array(masked_measurements)
+    
+        ## Apply mask to measurements
+        masked_measurements = masked_measurements.reshape(n_target_center * n_data, n_neighbor)
+        masked_measurements = cuda.to_device(masked_measurements)
+        n_measurement, _ = masked_measurements.shape
+        
+        """
+        Denoise
+        
+        Required GPU memory capacitiy
+            - measurements: (#center * #data, #neighbor)
+            - target_sqrt_precisions: (#center * #source, comb(#neighbor, 2))
+            - prec_indices: (#center * #data)
+            - denoised_masked_measurements: (#target_center * #data, #neighbor)
+        """
+        ## Prepare GPU kernel info
+        if n_measurement % n_thread_per_block == 0:
+            n_block_forDenoise = n_measurement // n_thread_per_block
+        else:
+            n_block_forDenoise = n_measurement // n_thread_per_block + 1
+        
+        ## Prepare information per measurement for denoising 
+        measusrement_info_df = pd.concat([measurement_sort_info] * n_target_center, ignore_index=True)
+        measusrement_info_df["target_center_i"] = np.repeat(np.arange(len(target_centers)), n_data)
+        measusrement_info_df = measusrement_info_df[["target_center_i", "session", "subSession", "condition"]]
+        measusrement_info_df["prec_i"] = measusrement_info_df["target_center_i"] * n_precision + measusrement_info_df["session"].map(session_index_info) * n_uq_subSession + measusrement_info_df["subSession"].map(subSession_index_info)
+        prec_indices = cuda.to_device(measusrement_info_df["prec_i"].to_numpy())
+        
+        ## Denoise measurements
+        denoised_masked_measurements = cuda.to_device(np.zeros(masked_measurements.shape))
+        denoise[n_block_forDenoise, n_thread_per_block](masked_measurements, 
+                                                        target_sqrt_precisions, 
+                                                        prec_indices, 
+                                                        mul_mapping, 
+                                                        denoised_masked_measurements)
+        cuda.synchronize()
+    
+        del masked_measurements
+        del target_sqrt_precisions
+        del prec_indices
+        cuda.defer_cleanup()
+    
+        """
+        Average data within same condition per session
+        """
+        # Skip...
+        
+        """
+        Calculate difference between measurement on same session
+    
+        Required GPU memory capacitiy
+            - measurements: (#center * #data, #neighbor)
+            - diff_index_arrays: (#center * #data, #neighbor)
+            - diff_index_arrays: (#center * #session #dissim, 2)
+            - diff_measurements: (#center * #session #dissim, #neighbor)
+        """
+        ## Prepare GPU kernel info
+        n_cal_diff = n_target_center * n_uq_session * n_dissim
+        if n_cal_diff % n_thread_per_block == 0:
+            n_block_forDiff = n_cal_diff // n_thread_per_block
+        else:
+            n_block_forDiff = n_cal_diff // n_thread_per_block + 1
+    
+        ## Prepare target index array to be differentiated
+        target_center_indices = np.repeat(np.arange(n_target_center, dtype = np.uint32), n_uq_session * n_dissim)
+        diff_measurement_index_df = pd.concat([diff_info_df[["cond1", "cond2", "cond1_i", "cond2_i"]]] * n_target_center, ignore_index=True) # repeat difference info up to cover all centers
+        diff_measurement_index_df["center_i"] = target_center_indices
+        diff_measurement_index_df["measurement_cond1_i"] = diff_measurement_index_df["center_i"] * n_data + diff_measurement_index_df["cond1_i"]
+        diff_measurement_index_df["measurement_cond2_i"] = diff_measurement_index_df["center_i"] * n_data + diff_measurement_index_df["cond2_i"]
+        diff_index_arrays = diff_measurement_index_df[["measurement_cond1_i", "measurement_cond2_i"]].to_numpy(dtype = np.uint32)
+        diff_index_arrays = cuda.to_device(diff_index_arrays)
+        del target_center_indices
+    
+        ## Calculate difference among conditions within same session
+        diff_measurements = cuda.to_device(np.zeros((n_target_center * n_uq_session * n_dissim, n_neighbor), dtype = dtype))
+        differentiate_measurements[n_block_forDiff, n_thread_per_block](denoised_masked_measurements, diff_index_arrays, diff_measurements)
+        cuda.synchronize()
+    
+        del diff_index_arrays
+        del denoised_masked_measurements
+        cuda.defer_cleanup()
+    
+        """
+        Cross-validated distance
+        """
+        target_cv_diff_indices = cuda.to_device(cv_diff_df[cv_diff_df["center_i"] < len(target_centers)].to_numpy(dtype = np.uint32))
+        n_cal = target_cv_diff_indices.shape[0]
+        
+        if n_cal_diff % n_thread_per_block == 0:
+            n_block_forCV = n_cal // n_thread_per_block
+        else:
+            n_block_forCV = n_cal // n_thread_per_block + 1
+    
+        distances_gpu = cuda.to_device(np.zeros((n_target_center, n_dissim, n_cv), dtype = dtype))
+        calc_cv_distance[n_block_forCV, n_thread_per_block](diff_measurements, target_cv_diff_indices, distances_gpu, n_dissim)
+        cuda.synchronize()
+        distances = distances_gpu.copy_to_host()
+        del distances_gpu
+        del target_cv_diff_indices
+        del diff_measurements
+    
+        distances = cp.mean(distances, axis = 2)
+        distances = distances / n_neighbor
+        rdm_outs.append(distances)
+        
+        cuda.defer_cleanup()
+    return rdm_outs, uq_conditions
+
+def calc_sl_rdm_crossnobises_SS(n_split_data: int,
+                                unique_n_neighbors: np.array, 
+                                precision_dir_path: str, 
+                                masking_indexes: np.array, 
+                                measurements: np.array, 
+                                conditions: np.array, 
+                                sessions: np.array,
+                                subSessions: np.array,
+                                n_thread_per_block: int = 1024,
+                                dtype = np.float32):
+    """
+    Calculate searchlight crossnobis rdm on each center considering subSession.
+    However, this function calculate RDM differently if n_neighbor is different
+    
+    1. load precision matrix for corresponding specific #neighbor on sqrt_precision_dir_path 
+    2. Calculate RDM with searchlight way
+
+    Notice) 
+    This function load precision matrix on sqrt_precision_dir_path.
+    So you have to check whether the precision matrices are not overlapped.
+    
+    :param n_split_data: how many datas to process at once
+    :param unique_n_neighbors: unique #neighbor 
+    :param sqrt_precision_dir_path: path saved for sqrt precision matrix
+    :param measurements(shape: #data, #channel): measurment values
+    :param masking_indexes(shape: #channel):  index of masking brain
+    :param conditions(shape: #data): condition array corresponding to measurements
+    :param sessions(shape: #data): session corressponding to conds
+    :param n_thread_per_block(int): block per thread
+    :param dtype: data type for storing array
+    
+    return (rsatoolbox.rdm.RDMs): RDM matrix about each brain coordinate
+    """
+
+    centers = []
+    rdms = []
+    for n_neighbor in unique_n_neighbors:
+        # Load precision matrix
+        sqrt_precision_dataSet_path = os.path.join(precision_dir_path, f"sqrt_precision_neighbor{n_neighbor}.npz")
+        sqrt_precision_dataSet = np.load(sqrt_precision_dataSet_path)
+        target_centers = sqrt_precision_dataSet["centers"]
+        target_neighbors = sqrt_precision_dataSet["neighbors"]
+        sqrt_precisions = sqrt_precision_dataSet["sqrt_precision"]
+        prec_types = sqrt_precision_dataSet["prec_types"]
+
+        # Calculate RDM with searchlight way
+        rdm, rdm_conds = calc_sl_rdm_crossnobis_SS(measurements = measurements,
+                                                    conditions = conditions,
+                                                    sessions = sessions,
+                                                    subSessions = subSessions,
+                                                    centers = target_centers,
+                                                    neighbors = target_neighbors,
+                                                    sqrt_precisions = sqrt_precisions,
+                                                    precision_types = prec_types,
+                                                    masking_indexes = masking_indexes,
+                                                    n_split_data = n_split_data)
+        rdm_arrays = np.concatenate(rdm, axis = 0)
+    
+        # Make sl_rdms
+        rdm_crossnobis_gpus = RDMs(rdm_arrays,
+                                   pattern_descriptors = {
+                                       "index" : np.arange(0, len(rdm_conds)).tolist(),
+                                       "events" : rdm_conds.tolist(),
+                                   },
+                                   rdm_descriptors = {
+                                       "voxel_index" : target_centers.tolist(),
+                                       "index" : np.arange(0, len(target_centers)).tolist()
+                                   })
         rdm_crossnobis_gpus.dissimilarity_measure = "crossnobis"
 
         # Acc

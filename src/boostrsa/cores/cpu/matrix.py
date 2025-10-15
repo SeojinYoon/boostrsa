@@ -41,4 +41,28 @@ def mean_fold_variance(variances, fold_info):
     
     return np.array(result_variances)
 
+def reconstruct_sl_precisionMats(sl_precisions: np.ndarray, n_neighbor: int) -> np.ndarray:
+    """
+    Reconstruct searchlight precision matrix from 1d(combination(n_neighbor, 2)) into 2d(n_neighbor * n_neighbor)
 
+    :param sl_precisions(shape - #center, #source, #element): array of precision matrices
+    :param n_neighbor: a number of neighbor of source from precision matrix
+    
+    return (shape - #center * n_source, n_spaital_dim, n_spatial_dim)
+    """
+    n_center, n_source, n_element = sl_precisions.shape
+    n_batch = n_center * n_source
+    
+    # Reconstruct matrix 
+    r, c = np.triu_indices(n_neighbor, k = 0)
+    dummy = np.zeros((n_batch, n_neighbor, n_neighbor))
+    packed = sl_precisions.reshape(n_batch, n_element)
+    dummy[:, r, c] = packed
+    
+    # Make symmetric matrix
+    dummy = dummy + np.swapaxes(dummy, -1, -2)
+    
+    # Correct digonal element
+    dummy[:, np.arange(n_neighbor), np.arange(n_neighbor)] = dummy[:, np.arange(n_neighbor), np.arange(n_neighbor)] / 2
+
+    return dummy

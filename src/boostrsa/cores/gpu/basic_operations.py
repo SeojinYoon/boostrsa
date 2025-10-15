@@ -1,5 +1,6 @@
 
 from numba import cuda, jit
+from numba.cuda.cudadrv.devicearray import DeviceNDArray
 
 @cuda.jit
 def calc_outerProduct(vec1, vec2, out):
@@ -78,13 +79,15 @@ def scaling(out, lambs):
                     out[i][j][k] = (1 - lamb)
 
 @cuda.jit(device=True, inline=True)
-def matmul(a, b, out):
+def matmul(a: DeviceNDArray, 
+           b: DeviceNDArray, 
+           out: DeviceNDArray):
     """
     Matrix multiplication a @ b
     
-    :param a(np.array): 2d matrix
-    :param b(np.array): 2d matrix
-    :param out(device array): output
+    :param a(shape - 2d): 2d matrix
+    :param b(shape - 2d): 2d matrix
+    :param out(shape - 2d): output
     """
     ar,ac = a.shape 
     br,bc = b.shape 
@@ -93,8 +96,64 @@ def matmul(a, b, out):
         for j in range(bc):
             for k in range(ac): # or br
                 out[i,j] += a[i,k] * b[k,j]
-    return out
 
+def matmul2(a: DeviceNDArray, 
+            b: DeviceNDArray, 
+            out: DeviceNDArray):
+    """
+    Matrix multiplication - vector @ array(2d)
+
+    :param a(shape: 1d): vector
+    :param b(shape: 2d): 2d array
+    :param output(shape: 1d): output array
+    """
+    n_component_A = a.shape[0]
+    n_row_B, n_col_B = b.shape
+
+    for i in range(n_component_A):
+        for j in range(n_row_B):
+            out[i] += a[j] * b[j, i]
+
+@cuda.jit(device=True, inline=True)
+def matmul_upperTmat(vector: DeviceNDArray, 
+                     upperTmat: DeviceNDArray, 
+                     mul_mapping: DeviceNDArray, 
+                     output: DeviceNDArray):
+    """
+    Multiply matrix with vector and symmetric matrix
+
+    calculation: vector @ upperTmat
+    
+    :param vector(shape : #element): vector
+    :param upperTmat(shape: #comb(#element, 2)): upper triangle matrix including diagnoal element
+    :param mul_mapping(shape: (#element, #element)): index mapping to be multiplied
+    :param output(shape: #element): output array
+    """
+    for vec_i in range(len(vector)):
+        for row_i in range(len(mul_mapping)):
+            output[vec_i] += vector[row_i] * upperTmat[mul_mapping[row_i, vec_i]]
+
+@cuda.jit(device=True, inline=True)
+def minus(a: DeviceNDArray, 
+          b: DeviceNDArray, 
+          out: DeviceNDArray):
+    """
+    Matrix multiplication a @ b
+    
+    :param a(shape - 1d): 1d matrix
+    :param b(shape - 1d): 1d matrix
+    :param out(shape - 1d): output
+    """
+    n_a = len(a)
+    
+    for i in range(n_a):
+        out[i] = a[i] - b[i]
+
+@cuda.jit(device=True, inline=True)
+def dot(a1, a2, output, output_i):
+    for i in range(len(a1)):
+        output[output_i] += a1[i] * a2[i]
+        
 if __name__ == "__main__":
     dummy_data = np.array([
         [
@@ -116,4 +175,60 @@ if __name__ == "__main__":
 
     out_sum_device = cuda.to_device(np.zeros((n_run, n_channel, n_channel)))
     outer_sum_square[1,1](dummy_data, out_sum_device)
+
+    # Matmul 1
+    input_ = cuda.to_device(np.array([[1,2,3]]))
+    array = cuda.to_device(np.arange(1, 10).reshape(3,3))
+    result = cuda.to_device(np.zeros((3,3)).reshape(3,3))
+    matmul(input_, array, result)
     
+    # Matmul 2
+    input_ = cuda.to_device(np.array([1,2,3]))
+    array = cuda.to_device(np.arange(1, 10).reshape(3,3))
+    result = cuda.to_device(np.zeros(3))
+    matmul2(input_, array, result)
+
+    # Matmul upper triangle mat
+    vector = cuda.to_device(np.array([1,2,3]))
+    n_element = vector.shape[0]
+    r_, c_ = np.triu_indices(n_element, k = 0)
+    upperTmat = np.array([
+        [1,2,3],
+        [2,4,5],
+        [3,5,2],
+    ])
+    upperTmat = cuda.to_device(upperTmat[r_, c_])
+    
+    mul_mapping = np.zeros((n_element, n_element))
+    mul_mapping[r_, c_] = np.arange(r_.shape[0])
+    mul_mapping += mul_mapping.T
+    idx = np.diag_indices(mul_mapping.shape[0])
+    mul_mapping[idx] = mul_mapping[idx] / 2
+    mul_mapping = mul_mapping.astype(int)
+    mul_mapping = cuda.to_device(mul_mapping)
+    output = cuda.to_device(np.zeros(n_element))
+
+    matmul_upperTmat(vector = vector, 
+                 upperTmat = upperTmat, 
+                 mul_mapping = mul_mapping, 
+                 output = output)
+
+    # Minus
+    a = cuda.to_device(np.ones(3))
+    b = cuda.to_device(np.ones(3) * 2)
+    output = cuda.to_device(np.zeros(3))
+    
+    @cuda.jit
+    def minus_jit(a, b, out):
+        minus(a, b, out)
+    minus_jit[1,1](a, b, output)
+
+    # Dot product
+    a1 = np.array([1,2,3])
+    a2 = np.array([1,2,3])
+    output = np.array([0])
+    
+    @cuda.jit
+    def dot_test(a1, a2, output):
+        dot(a1, a2, output, 0)
+    dot_test[1,1](a1, a2, output)

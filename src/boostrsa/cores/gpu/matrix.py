@@ -1,13 +1,16 @@
 
 import os
 import sys
+import cupy as cp
+import numpy as np
 from numba import cuda, jit
+from numba.cuda.cudadrv.devicearray import DeviceNDArray
 
 if os.getenv("boostrsa_isRunSource"):
     sys.path.append(os.getenv("boostrsa_source_home"))
-    from cores.gpu.basic_operations import matmul
+    from cores.gpu.basic_operations import matmul, matmul_upperTmat, minus, dot
 else:
-    from boostrsa.cores.gpu.basic_operations import matmul
+    from boostrsa.cores.gpu.basic_operations import matmul, matmul_upperTmat, minus, dot
 
 @jit(nopython=True)
 def upper_tri_1d_index(i, j, n_col, k):
@@ -76,13 +79,15 @@ def eyes(out):
             out[i][j][j] = 1
 
 @cuda.jit
-def rdm_from_kernel(kernels, div, out):
+def rdm_from_kernel(kernels: DeviceNDArray, 
+                    div: int, 
+                    out: DeviceNDArray):
     """
     Calculate rdm matrix
     
-    :param kernels(Device array): kernel, shape: (n_data, n_fold, n_cond, n_cond))
-    :param div(int): div value
-    :param out(Device array): rdm output, shape: (n_data, n_fold, n_dissim)
+    :param kernels(shape: (#data, #fold, #cond, #cond)): kernel
+    :param div: denominator for each output element
+    :param out(shape: (#data, #fold, #dissim)): rdm output
     """
     n_data = kernels.shape[0]
     n_validation = kernels.shape[1]
@@ -105,15 +110,19 @@ def rdm_from_kernel(kernels, div, out):
                         out[i][j][dissim_i] = (v1 - v2) / div
 
 @cuda.jit
-def calc_kernel(measurments, precisions, fold_info, out1, out2):
+def calc_kernel(measurments: DeviceNDArray, 
+                precisions: DeviceNDArray, 
+                fold_info: DeviceNDArray, 
+                out1: DeviceNDArray, 
+                out2: DeviceNDArray):
     """
     Calculate rdm kernel for calculating crossnobis
     
-    :param measurments(Device array): , shape: (n_data, n_run, n_cond, n_neighbor)
-    :param precisions(Device array): , shape: (n_data, n_fold, n_neighbor, n_neighbor)
-    :param fold_info(Device array): fold information - [[fold1, fold2], ...]
-    :param out1(Device array): intermediate matmul output , shape: (n_data, n_fold, n_cond, n_neighbor) 
-    :param out2(Device array): kernel output , shape: (n_data, n_fold, n_cond, n_cond))
+    :param measurments(shape: (#data, #run, #cond, #neighbor)):
+    :param precisions(shape: (#data, #fold, #neighbor, #neighbor)): 
+    :param fold_info: fold information - [[fold1, fold2], ...]
+    :param out1(shape: (#data, #fold, #cond, #neighbor)): intermediate matmul output
+    :param out2(shape: (#data, #fold, #cond, #cond)): kernel output
     """
     n_data = out1.shape[0]
     n_validation = out1.shape[1]
@@ -127,3 +136,95 @@ def calc_kernel(measurments, precisions, fold_info, out1, out2):
             matmul(measurments[i][data1_i], precisions[i][j], out1[i][j])
             matmul(out1[i][j], measurments[i][data2_i].T, out2[i][j])
 
+@cuda.jit
+def denoise(measurements: DeviceNDArray,
+            sqrt_precisions: DeviceNDArray,
+            sqrt_precisionMat_indices: DeviceNDArray,
+            mul_mapping : DeviceNDArray,
+            output: DeviceNDArray):
+    """
+    Denoise measurement using precision matrix
+
+    denoised_measurement = measurement @ (precision^(1/2))
+    
+    :param measurements(shape: #measurement, n_neighbor): measurement arrays
+    :param sqrt_precisions(shape: (#center * #source, #element)): precision matricies
+    :param sqrt_precisionMat_indices(shape: #measurement): corresponding precision mat index per measurement
+    :param mul_mapping(shape: (#element, #element)): index mapping to be multiplied
+    :param output(shape: (#measurement, #n_neighbor)): output array
+    """
+    i = cuda.grid(1)
+    if i >= len(measurements):
+        return
+        
+    sqrt_precisionMat_i = sqrt_precisionMat_indices[i]
+    matmul_upperTmat(measurements[i], sqrt_precisions[sqrt_precisionMat_i], mul_mapping, output[i])
+
+@cuda.jit
+def differentiate_measurements(measurements, diff_index_arrays, output):
+    i = cuda.grid(1)
+    if i >= len(diff_index_arrays):
+        return
+    
+    cond1_i, cond2_i = diff_index_arrays[i]
+    minus(measurements[cond1_i], measurements[cond2_i], output[i])
+
+@cuda.jit
+def calc_cv_distance(diff_measurements, cv_diff_df, output, n_dissim):
+    i = cuda.grid(1)
+    if i >= len(cv_diff_df):
+        return
+    center_i, dissim_i, diff1_i, diff2_i, cv_i = cv_diff_df[i]
+    dot(diff_measurements[diff1_i], diff_measurements[diff2_i], output[center_i][dissim_i], cv_i)
+
+def calc_sqrtMat(matrices: np.ndarray) -> np.ndarray:
+    """
+    Calculate sqrt using eigen value
+
+    Q @ diag(sqrt(w)) @ Q^T
+    
+    :param matrices(shape - #batch, #element, #element): A matrix for which you want to take the square root
+
+    return (shape - #batch, #element, #element)
+    """
+    # Memory pool
+    mempool = cp.get_default_memory_pool()
+    
+    # Eigen value decomposition
+    w, Q = cp.linalg.eigh(matrices) # w:(n_batch, n_element), Q:(n_batch, n_element, n_element)
+    w = cp.clip(w, 0, None)
+    
+    # Calculate sqrt matrix
+    w_sqrt = cp.sqrt(w)
+    X = (Q * w_sqrt[..., None, :]) @ cp.swapaxes(Q, -1, -2)   # (b,n,n)
+    X = cp.asnumpy(X)
+
+    # Clean memory
+    mempool.free_all_blocks()
+    
+    return X
+    
+if __name__ == "__main__":
+    # diag
+    matrices = np.array([
+        [[1, 2, 3],
+         [4, 5, 6],
+         [7, 8, 9]],
+        [[9, 8, 7],
+         [6, 5, 4],
+         [3, 2, 1]],
+        [[2, 0, 1],
+         [0, 3, 0],
+         [4, 0, 5]]
+    ], dtype=np.float32)
+    
+    n_matrices = matrices.shape[0]
+    n_rows = matrices.shape[1]
+    out = np.zeros((n_matrices, n_rows), dtype=np.float32)
+    
+    d_matrices = cuda.to_device(matrices)
+    d_out = cuda.to_device(out)
+    
+    threads_per_block = 32
+    blocks_per_grid = (n_matrices + (threads_per_block - 1)) // threads_per_block
+    diag[blocks_per_grid, threads_per_block](d_matrices, d_out)

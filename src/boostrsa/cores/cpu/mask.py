@@ -1,7 +1,7 @@
 
 import numpy as np
 
-def set_mask(neighbors, brain_1d_indexes):
+def set_mask_cpu(neighbors, brain_1d_indexes):
     """
     Set neighbor mask(iterate over all neighbors)
 
