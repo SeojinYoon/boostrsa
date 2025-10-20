@@ -52,17 +52,15 @@ def reconstruct_sl_precisionMats(sl_precisions: np.ndarray, n_neighbor: int) -> 
     """
     n_center, n_source, n_element = sl_precisions.shape
     n_batch = n_center * n_source
-    
-    # Reconstruct matrix 
+
+    # Indices
     r, c = np.triu_indices(n_neighbor, k = 0)
+    off = (r != c)
+    
+    # Reconstruct matrix
     dummy = np.zeros((n_batch, n_neighbor, n_neighbor))
     packed = sl_precisions.reshape(n_batch, n_element)
-    dummy[:, r, c] = packed
+    dummy[:, r, c] = packed # Allocate upper triangle elements
+    dummy[:, c[off], r[off]] = packed[:, off] # Allocate lower triangle elements
     
-    # Make symmetric matrix
-    dummy = dummy + np.swapaxes(dummy, -1, -2)
-    
-    # Correct digonal element
-    dummy[:, np.arange(n_neighbor), np.arange(n_neighbor)] = dummy[:, np.arange(n_neighbor), np.arange(n_neighbor)] / 2
-
     return dummy

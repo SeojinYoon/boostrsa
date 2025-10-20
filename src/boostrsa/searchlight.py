@@ -279,6 +279,7 @@ def calc_sl_precisions(centers: np.array,
 
     return {
         "#neighbor{number}" : {
+            "path" : saved path
             "center_indices" : center 1d indicies,
             "neighbor_indices" : neighbor 1d indices,
             "prec_types" : precision types
@@ -289,15 +290,32 @@ def calc_sl_precisions(centers: np.array,
     n_neighbors = np.array([neighbor.shape[-1] for neighbor in neighbors])
     uq_neighbors = np.unique(n_neighbors)
 
+    # Result
+    result_info = {}
+    
     # Investigate whether save_dir_path has already precision matrix
-    save_paths = [os.path.join(save_dir_path, f"precision_neighbor{n_neighbor}.npz") for n_neighbor in uq_neighbors]
-    for path in save_paths:
+    paths = [os.path.join(save_dir_path, f"precision_neighbor{n_neighbor}.npz") for n_neighbor in uq_neighbors]
+    save_paths = []
+    for path in paths:
         if os.path.exists(path):
+            precision_dataSet = np.load(path)
+            target_centers = precision_dataSet["centers"]
+            target_neighbors = precision_dataSet["neighbors"]
+            prec_types = precision_dataSet["prec_types"]
+            n_neighbor = target_neighbors.shape[1]
+            
+            result_info[f"#neighbor{n_neighbor}"] = {
+                "path" : path,
+                "center_indices" : target_centers,
+                "neighbor_indices" : target_neighbors,
+                "prec_types" : prec_types,
+            }
+                
             print(f"already exist: {path}")
-            return
+        else:
+            save_paths.append(path)
 
     # Calculate precision matrix using searchlight method per #neighbor
-    result_info = {}
     for n_neighbor, save_path in zip(uq_neighbors, save_paths):
         flags = (n_neighbors == n_neighbor)
         target_centers = centers[flags]
@@ -330,26 +348,55 @@ def calc_sl_precisions(centers: np.array,
         
     return result_info
 
-def sqrt_precisions(precision_paths: list, 
-                    save_dir_path: str,
-                    dtype = np.float32):
+def calc_sqrt_precisions(precision_paths: list, 
+                         save_dir_path: str,
+                         n_batch: int,
+                         dtype = np.float32):
     """
     Calculat square root about searchlight precision matrix
     & Save the results on the save_dir_path
     
     :param precision_paths(element: str): precision matrix paths
     :param save_dir_path: directory path for saving sqrt precision
+    :param n_batch: how many datas to process at once
+    
+    return {
+        "#neighbor{number}" : {
+            "path" : saved path
+            "center_indices" : center 1d indicies,
+            "neighbor_indices" : neighbor 1d indices,
+            "prec_types" : precision types
+        }
+    }
     """
     if np.all([os.path.exists(path) for path in precision_paths]) == np.True_:
         print(f"exist all precision matrices")
 
-    save_paths = [os.path.join(save_dir_path, "sqrt" + "_" + Path(path).name) for path in precision_paths]
-    for path in save_paths:
-        if os.path.exists(path):
-            print(f"already exist: {path}")
-            return
-
+    # Result
     result_info = {}
+    
+    # Investigate whether save_dir_path has already precision matrix
+    paths = [os.path.join(save_dir_path, "sqrt" + "_" + Path(path).name) for path in precision_paths]
+    save_paths = []
+    for path in paths:
+        if os.path.exists(path):
+            precision_dataSet = np.load(path)
+            target_centers = precision_dataSet["centers"]
+            target_neighbors = precision_dataSet["neighbors"]
+            prec_types = precision_dataSet["prec_types"]
+            n_neighbor = target_neighbors.shape[1]
+            
+            result_info[f"#neighbor{n_neighbor}"] = {
+                "path" : path,
+                "center_indices" : target_centers,
+                "neighbor_indices" : target_neighbors,
+                "prec_types" : prec_types,
+            }
+                
+            print(f"already exist: {path}")
+        else:
+            save_paths.append(path)
+
     for path, save_path in zip(precision_paths, save_paths):
         # Load precision matrices
         precision_dataSet = np.load(path)
@@ -361,10 +408,15 @@ def sqrt_precisions(precision_paths: list,
         # Reconstruct precision matrix from 1D matrix into 2D matrix
         _, n_neighbor = target_neighbors.shape
         n_center, n_source, n_element = sl_precisions.shape
-        sl_precisions = reconstruct_sl_precisionMats(sl_precisions, n_neighbor = n_neighbor)
+
+        sqrt_precisions = []
+        for i in trange(0, n_center, n_batch):
+            reconstructionMat = reconstruct_sl_precisionMats(sl_precisions[i:i + n_batch], n_neighbor)
+            sqrt_precision = calc_sqrtMat(reconstructionMat)
+            sqrt_precisions.append(sqrt_precision)
+        sqrt_precisions = np.concatenate(sqrt_precisions, axis = 0) # shape: (#center * #source, #n_neighbor, #n_neighbor)
         
         # Calculate square root about the precision matrix 
-        sqrt_precisions = calc_sqrtMat(sl_precisions) # shape: (#center * #source, #n_neighbor, #n_neighbor)
         r, c = np.triu_indices(n_neighbor, k = 0) # get upper triangle indices from #neighbor x #neighbor matrix
         sqrt_precisions = sqrt_precisions[:, r, c] # shape: (#center * #source, #comb(n_neighbor, 2))
         sqrt_precisions = sqrt_precisions.reshape((n_center, n_source, -1)) # shape: (#center, #source, #comb(n_neighbor, 2))
