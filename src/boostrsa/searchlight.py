@@ -1,11 +1,14 @@
 
 # Common Libraries
+import re
 import os
 import sys
+import math
 import itertools
 import cupy as cp
 import numpy as np
 import pandas as pd
+from glob import glob
 from tqdm import trange
 from pathlib import Path
 from numba import cuda, jit
@@ -94,6 +97,7 @@ def calc_sl_precision(residuals: np.ndarray,
 
         # Calculate precision matrix
         stack_precisions = cp.linalg.inv(cp.asarray(covariances)).get()
+        del covariances
         
         # sync
         cuda.synchronize()
@@ -132,7 +136,7 @@ def calc_sl_rdm_crossnobis(n_split_data: int,
     :param masking_indexes(shape: #channel): index of masking brain
     :param conds(shape: #data): condition per data
     :param sessions(shape: #data): session corressponding to conds
-    :param n_thread_per_block: block per thread
+    :param n_thread_per_block: #thread per GPU block
     :param dtype: data type for storing array
     """
     if measurements.dtype != dtype:
@@ -295,14 +299,13 @@ def calc_sl_precisions(centers: np.array,
     
     # Investigate whether save_dir_path has already precision matrix
     paths = [os.path.join(save_dir_path, f"precision_neighbor{n_neighbor}.npz") for n_neighbor in uq_neighbors]
-    save_paths = []
-    for path in paths:
+    path_forMapping = []
+    for n_neighbor, path in zip(uq_neighbors, paths):
         if os.path.exists(path):
             precision_dataSet = np.load(path)
             target_centers = precision_dataSet["centers"]
             target_neighbors = precision_dataSet["neighbors"]
             prec_types = precision_dataSet["prec_types"]
-            n_neighbor = target_neighbors.shape[1]
             
             result_info[f"#neighbor{n_neighbor}"] = {
                 "path" : path,
@@ -310,13 +313,13 @@ def calc_sl_precisions(centers: np.array,
                 "neighbor_indices" : target_neighbors,
                 "prec_types" : prec_types,
             }
-                
+
             print(f"already exist: {path}")
         else:
-            save_paths.append(path)
+            path_forMapping.append((n_neighbor, path))
 
     # Calculate precision matrix using searchlight method per #neighbor
-    for n_neighbor, save_path in zip(uq_neighbors, save_paths):
+    for n_neighbor, save_path in path_forMapping:
         flags = (n_neighbors == n_neighbor)
         target_centers = centers[flags]
         
@@ -369,72 +372,115 @@ def calc_sqrt_precisions(precision_paths: list,
         }
     }
     """
-    if np.all([os.path.exists(path) for path in precision_paths]) == np.True_:
-        print(f"exist all precision matrices")
-
     # Result
     result_info = {}
     
     # Investigate whether save_dir_path has already precision matrix
-    paths = [os.path.join(save_dir_path, "sqrt" + "_" + Path(path).name) for path in precision_paths]
-    save_paths = []
-    for path in paths:
-        if os.path.exists(path):
-            precision_dataSet = np.load(path)
+    sqrt_paths = [os.path.join(save_dir_path, "sqrt" + "_" + Path(path).name) for path in precision_paths]
+    path_forMapping = []
+    for precision_path, sqrt_path in zip(precision_paths, sqrt_paths):
+        if os.path.exists(sqrt_path):
+            precision_dataSet = np.load(sqrt_path)
             target_centers = precision_dataSet["centers"]
             target_neighbors = precision_dataSet["neighbors"]
             prec_types = precision_dataSet["prec_types"]
             n_neighbor = target_neighbors.shape[1]
             
             result_info[f"#neighbor{n_neighbor}"] = {
-                "path" : path,
+                "path" : sqrt_path,
                 "center_indices" : target_centers,
                 "neighbor_indices" : target_neighbors,
                 "prec_types" : prec_types,
             }
                 
-            print(f"already exist: {path}")
+            print(f"already exist: {sqrt_path}")
         else:
-            save_paths.append(path)
-
-    for path, save_path in zip(precision_paths, save_paths):
+            path_forMapping.append((precision_path, sqrt_path))
+    
+    # Loop for all targets
+    for precision_path, sqrt_path in path_forMapping:
+        save_path_info = Path(sqrt_path)
+        file_name = save_path_info.stem
+        extension = save_path_info.suffix
+        
         # Load precision matrices
-        precision_dataSet = np.load(path)
-        target_centers = precision_dataSet["centers"]
-        target_neighbors = precision_dataSet["neighbors"]
+        precision_dataSet = np.load(precision_path)
+        centers = precision_dataSet["centers"]
+        neighbors = precision_dataSet["neighbors"]
         sl_precisions = precision_dataSet["precision"]
         prec_types = precision_dataSet["prec_types"]
+        print(f"load {precision_path}")
         
         # Reconstruct precision matrix from 1D matrix into 2D matrix
-        _, n_neighbor = target_neighbors.shape
+        _, n_neighbor = neighbors.shape
         n_center, n_source, n_element = sl_precisions.shape
-
-        sqrt_precisions = []
-        for i in trange(0, n_center, n_batch):
-            reconstructionMat = reconstruct_sl_precisionMats(sl_precisions[i:i + n_batch], n_neighbor)
-            sqrt_precision = calc_sqrtMat(reconstructionMat)
-            sqrt_precisions.append(sqrt_precision)
-        sqrt_precisions = np.concatenate(sqrt_precisions, axis = 0) # shape: (#center * #source, #n_neighbor, #n_neighbor)
-        
-        # Calculate square root about the precision matrix 
         r, c = np.triu_indices(n_neighbor, k = 0) # get upper triangle indices from #neighbor x #neighbor matrix
-        sqrt_precisions = sqrt_precisions[:, r, c] # shape: (#center * #source, #comb(n_neighbor, 2))
-        sqrt_precisions = sqrt_precisions.reshape((n_center, n_source, -1)) # shape: (#center, #source, #comb(n_neighbor, 2))
-        sqrt_precisions = sqrt_precisions.astype(dtype)
         
-        # Save the sqrt precision result
-        np.savez(save_path, 
-                 centers = target_centers, 
-                 neighbors = target_neighbors,
-                 sqrt_precision = sqrt_precisions,
-                 prec_types = prec_types)
-        print(f"save_path: {save_path}")
-        result_info[f"#neighbor{n_neighbor}"] = {
-            "path" : save_path,
-            "center_indices" : target_centers,
-            "neighbor_indices" : target_neighbors,
-            "prec_types" : prec_types,
-        }
+        # Loop across all centers
+        for chunk_i in trange(0, math.ceil(n_center / n_batch)):
+            selecting = range(chunk_i * n_batch, min((chunk_i+1) * n_batch, n_center))
+            
+            target_centers = centers[selecting]
+            n_target_center = len(target_centers)
+            target_neighbors = neighbors[selecting]
+            target_sl_precisions = sl_precisions[selecting]
+            reconstructionMat = reconstruct_sl_precisionMats(target_sl_precisions, n_neighbor)
+            
+            # Calculate square root about the precision matrix 
+            sqrt_precision = calc_sqrtMat(reconstructionMat) # shape: (#center * #source, #n_neighbor, #n_neighbor)
+            sqrt_precision = sqrt_precision[:, r, c] # shape: (#center * #source, #comb(n_neighbor, 2))
+            sqrt_precision = sqrt_precision.reshape((n_target_center, n_source, -1)) # shape: (#center, #source, #comb(n_neighbor, 2))
+            sqrt_precision = sqrt_precision.astype(dtype)
+        
+            # Save the sqrt precision result
+            chunk_save_path = os.path.join(save_dir_path, file_name + f"_chunk{chunk_i}" + extension)
+            np.savez(chunk_save_path, 
+                     centers = target_centers, 
+                     neighbors = target_neighbors,
+                     sqrt_precision = sqrt_precision,
+                     prec_types = prec_types)
+            print(f"save_path: {chunk_save_path}")
+            
+            del sqrt_precision
+        del precision_dataSet
+        del sl_precisions
+    
+        # Load all chunk datas and concatenate all datas
+        chunk_paths = glob(os.path.join(save_dir_path, f"{file_name}_chunk*"))
+        chunk_paths = sorted(chunk_paths, key = lambda x: int(re.search(r'chunk(\d+)', x).group(1)))
+        chunkSets = [np.load(path) for path in chunk_paths]
+        is_same_sources = np.all([chunkSets[0]["prec_types"] == chunkSet["prec_types"] for chunkSet in chunkSets])
+        if is_same_sources:
+            centers_ = np.concatenate([chunkSet["centers"] for chunkSet in chunkSets])
+            neighbors_ = np.concatenate([chunkSet["neighbors"] for chunkSet in chunkSets])
+        
+            sqrt_precisions = []
+            for chunkSet in chunkSets:
+                sqrt_precisions.append(chunkSet["sqrt_precision"])
+            sqrt_precision = np.concatenate(sqrt_precisions, axis = 0)
+            del sqrt_precisions
+        
+            assert np.all([chunkSet["prec_types"] == chunkSets[0]["prec_types"] for chunkSet in chunkSets]), "Check"
+            prec_types = chunkSets[0]["prec_types"]
+        
+            np.savez(sqrt_path, 
+                     centers = centers_, 
+                     neighbors = neighbors_,
+                     sqrt_precision = sqrt_precision,
+                     prec_types = prec_types)
+            print(f"save: {sqrt_path}")
+            del sqrt_precision
+            
+            result_info[f"#neighbor{n_neighbor}"] = {
+                "path" : sqrt_path,
+                "center_indices" : centers_,
+                "neighbor_indices" : neighbors_,
+                "prec_types" : prec_types,
+            }
+            
+            for path in chunk_paths:
+                os.system(f"rm {path}")
+                print(f"remove: {path}")
     return result_info
 
 def calc_sl_rdm_crossnobises(n_split_data: int,
@@ -551,6 +597,11 @@ def calc_sl_rdm_crossnobis_SS(measurements: np.ndarray,
     if measurements.dtype != dtype:
         measurements = measurements.astype(dtype)
         sqrt_precisions = sqrt_precisions.astype(dtype)
+
+    # Convert data types
+    sessions = np.array(sessions).astype(str)
+    subSessions = np.array(subSessions).astype(str)
+    conditions = np.array(conditions).astype(str)
     
     # Get unique element according to appearance order
     uq_sessions = np.array(list(dict.fromkeys(sessions)))
@@ -674,26 +725,12 @@ def calc_sl_rdm_crossnobis_SS(measurements: np.ndarray,
             - masked_measurements: (#center * #data, #neighbor)
         """
         # Masking
-        cpu_mask = set_mask_cpu(target_neighbors, masking_indexes)
-
-        """
-        if n_target_center % n_thread_per_block == 0:
-            n_block_forMask = n_target_center // n_thread_per_block
-        else:
-            n_block_forMask = n_target_center // n_thread_per_block + 1
-        mask_out = cuda.to_device(np.zeros((n_target_center, n_channel), dtype = np.uint8))
-        set_mask_gpu[n_block_forMask, n_thread_per_block](target_neighbors, masking_indexes, mask_out)
-        cuda.synchronize()
-
-        del mask_out
-        cuda.defer_cleanup()
-        """
+        mask = set_mask_cpu(target_neighbors, masking_indexes)
         
         ## Make mask
-        # cpu_mask = mask_out.copy_to_host()
         masked_measurements = []
         for j in range(n_target_center):
-            masked_measurements.append(measurements[:, cpu_mask[j] == 1])
+            masked_measurements.append(measurements[:, mask[j] == 1])
         masked_measurements = np.array(masked_measurements)
     
         ## Apply mask to measurements
@@ -847,7 +884,8 @@ def calc_sl_rdm_crossnobises_SS(n_split_data: int,
         target_neighbors = sqrt_precision_dataSet["neighbors"]
         sqrt_precisions = sqrt_precision_dataSet["sqrt_precision"]
         prec_types = sqrt_precision_dataSet["prec_types"]
-
+        print(f"loaded: {sqrt_precision_dataSet_path}")
+        
         # Calculate RDM with searchlight way
         rdm, rdm_conds = calc_sl_rdm_crossnobis_SS(measurements = measurements,
                                                     conditions = conditions,
@@ -876,15 +914,16 @@ def calc_sl_rdm_crossnobises_SS(n_split_data: int,
         # Acc
         rdms.append(rdm_crossnobis_gpus)
         centers.append(target_centers)
-    
+        
     # Concat
     centers = np.concatenate(centers)
-    
     rdms = concat(rdms)
     rdms.rdm_descriptors["voxel_index"] = centers.tolist()
     
-    # Reorder
-    rdms = rdms.subsample(by = "voxel_index", value = np.sort(centers))
-    
+    # Sorting
+    sorted_voxel_indices = np.argsort(rdms.rdm_descriptors["voxel_index"])
+    rdms.dissimilarities = rdms.dissimilarities[sorted_voxel_indices]
+    rdms.rdm_descriptors["voxel_index"] = centers[sorted_voxel_indices]
+
     return rdms
     
